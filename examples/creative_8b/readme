@@ -1,0 +1,113 @@
+  在启动脚本中添加参数：
+
+  # 示例1: 使用 v1 模板（默认），去掉 think 标签（默认）
+  +reward_model.data_processor_config.template_version="v1" \
+  +reward_model.data_processor_config.strip_think_tag=True \
+
+  # 示例2: 使用 v0 模板，不去掉 think 标签
+  +reward_model.data_processor_config.template_version="v0" \
+  +reward_model.data_processor_config.strip_think_tag=False \
+
+  # 示例3: 使用 v1 模板，保留完整 response（包括 think 部分）
+  +reward_model.data_processor_config.template_version="v1" \
+  +reward_model.data_processor_config.strip_think_tag=False \
+
+  参数说明：
+
+  - template_version:
+    - "v1" (默认): 使用包含5个评价标准的模板（Instruction Compliance & Consistency, Usefulness, Level of Detail, Relevance, Factual Accuracy）
+    - "v0": 使用包含4个评价标准的模板（Instruction Adherence, Usefulness, Level of Detail, Relevance）
+  - strip_think_tag:
+    - True (默认): 只把 </think> 后的内容交给 reward model 评价
+    - False: 把完整的 response（包括 think 部分）交给 reward model 评价
+
+完成！我已经实现了你要求的所有功能。现在你可以在 wandb 中看到 reward model 的详细统计信息了。
+
+  ✅ 实现内容总结
+
+  1. Reward Model 输出长度统计 (要求 1)
+
+  修改的文件：
+  - /workspace/qingnan/verl/verl/workers/roles/reward_model_engine/vllm_reward_model.py
+  - /workspace/qingnan/verl/verl/workers/roles/reward_model.py
+  - /workspace/qingnan/verl/verl/trainer/ppo/ray_trainer.py
+
+  在 wandb 中新增的指标：
+  - reward_model/output_length_tokens_min - 输出长度最小值（tokens）
+  - reward_model/output_length_tokens_mean - 输出长度平均值（tokens）
+  - reward_model/output_length_tokens_max - 输出长度最大值（tokens）
+  - reward_model/output_clip_ratio - 被截断的输出比例（达到或接近 max_tokens 的比例）
+  - reward_model/max_tokens_config - 配置的最大 token 数（用于参考）
+
+  2. 分数提取方法统计 (要求 2)
+
+  修改的文件：
+  - /workspace/qingnan/verl/examples/creative/deepseek_grm_process_fn.py
+
+  提取方法类型：
+  - primary_boxed - 成功从 \boxed{} 中提取（正常情况）
+  - fallback_score_colon - 从 "Score: X" 格式提取
+  - fallback_chinese - 从 "评分: X" 格式提取
+  - fallback_points - 从 "(X points)" 格式提取
+  - fallback_rating - 从 "Rating: X" 格式提取
+  - fallback_overall - 从 "Overall: X" 格式提取
+  - fallback_last_number - 从最后的数字提取（风险较高）
+  - failed_return_0 - 完全无法提取，返回 0
+  - exception_return_0 - 异常情况返回 0
+
+  在 wandb 中新增的指标：
+  - reward_model/extraction_{method} - 每种提取方法的使用次数
+  - reward_model/extraction_{method}_ratio - 每种提取方法的使用比例
+
+  3. 在 wandb 中的可视化
+
+  启动训练后，你可以在 wandb dashboard 中看到：
+
+  输出长度面板
+
+  reward_model/output_length_tokens_min   (例如: 856)
+  reward_model/output_length_tokens_mean  (例如: 2341.5)
+  reward_model/output_length_tokens_max   (例如: 11998)
+  reward_model/output_clip_ratio          (例如: 0.023，表示 2.3% 被截断)
+  reward_model/max_tokens_config          (例如: 12000)
+
+  分数提取方法面板
+
+  reward_model/extraction_primary_boxed         (例如: 248)
+  reward_model/extraction_primary_boxed_ratio   (例如: 0.969，表示 96.9%)
+  reward_model/extraction_fallback_score_colon  (例如: 5)
+  reward_model/extraction_fallback_score_colon_ratio (例如: 0.020，表示 2.0%)
+  reward_model/extraction_failed_return_0       (例如: 3)
+  reward_model/extraction_failed_return_0_ratio (例如: 0.011，表示 1.1%)
+
+  📊 如何解读这些指标
+
+  健康状态指标：
+
+  - ✅ primary_boxed_ratio > 95% - 说明提取非常稳定
+  - ⚠️ clip_ratio > 5% - 需要增加 response_length
+  - 🔴 failed_return_0_ratio > 5% - 严重问题，需要排查
+
+  示例分析场景：
+
+  场景 1：正常情况
+  output_length_tokens_mean: 2341
+  output_clip_ratio: 0.01  (1%)
+  extraction_primary_boxed_ratio: 0.98  (98%)
+  ✅ 解读：系统运行良好，几乎所有输出都能正常完成并提取分数
+
+  场景 2：截断问题
+  output_length_tokens_mean: 11500
+  output_clip_ratio: 0.15  (15%)
+  extraction_primary_boxed_ratio: 0.85  (85%)
+  extraction_failed_return_0_ratio: 0.10  (10%)
+  ⚠️ 解读：15% 的输出被截断，导致 10% 的分数提取失败
+  🔧 建议：将 reward_model.response_length 从 12000 增加到 15000
+
+  💡 下一步建议
+
+  1. 监控 clip_ratio：如果 > 5%，建议在启动脚本中增加：
+  reward_model.response_length=15000
+  2. 监控提取失败率：如果 failed_return_0_ratio > 2%，可以添加 stop 序列：
+  +reward_model.stop='["\\boxed{"]'
+  3. 定期查看日志：检查 /workspace/qingnan/verl/examples/tmp/deepseek_grm_debug.log 了解失败案例

@@ -1,0 +1,46 @@
+# DeepSeek-GRM generative reward model configuration
+# This file defines the reward model config for use with the new RewardModelWorker
+
+enable: True
+name: sglang
+model_type: generative
+
+# Model configuration (HFModelConfig)
+model_config:
+  _target_: verl.workers.config.HFModelConfig
+  path: /workspace/qingnan/model/DeepSeek-GRM-16B
+  trust_remote_code: True
+
+# Input model config (set to null if using same tokenizer)
+input_model_config: null
+
+# Sequence lengths
+prompt_length: 17000
+response_length: 13000
+max_model_len: 32768
+
+# Parallelism and batching
+tensor_model_parallel_size: 1
+micro_batch_size_per_gpu: 32
+max_num_seqs: 64
+
+# Data processing functions
+data_processor_config:
+  _target_: verl.workers.config.RewardModelDataProcessorConfig
+  path: /workspace/qingnan/verl/examples/creative/deepseek_grm_process_fn.py
+  preprocess_fn_name: construct_deepseek_grm_inputs
+  postprocess_fn_name: convert_deepseek_grm_output_to_reward
+
+# Sampling configuration for generative model
+sampling_config:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+
+# Server configuration
+server_config:
+  timeout: 600
+  max_attempts: 3
+  retry_delay: 1
+  max_connections: 1000
+  max_start_wait_time: 600

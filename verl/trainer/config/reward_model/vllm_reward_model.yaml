@@ -1,0 +1,79 @@
+# vLLM-based generative reward model configuration
+# This extends the base reward_model.yaml for use with new RewardModelWorker
+# Alternative to sglang_reward_model for environments without sglang
+
+# defaults specify the default config from each component
+defaults:
+  # inherit from base reward_model config
+  - reward_model
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Enable reward model
+enable: True
+
+# Reward model name (vllm for generative models)
+name: vllm
+
+# Model type: "discriminative" or "generative"
+# Note: Currently only "generative" is supported for vLLM backend
+model_type: generative
+
+# Model configuration (HFModelConfig)
+model_config:
+  _target_: verl.workers.config.HFModelConfig
+  path: ???  # Must be set via command line
+  trust_remote_code: True
+
+# Input model config (set to null if using same tokenizer as reward model)
+input_model_config: null
+
+# Sequence lengths for generative reward model
+prompt_length: 16000
+response_length: 512
+max_model_len: 32768
+
+# Parallelism settings
+tensor_model_parallel_size: 1
+
+# Batch size per GPU
+micro_batch_size_per_gpu: 32
+
+# Maximum concurrent sequences
+max_num_seqs: 64
+
+# Maximum number of batched tokens
+max_num_batched_tokens: 8192
+
+# Data processing configuration
+data_processor_config:
+  _target_: verl.workers.config.RewardModelDataProcessorConfig
+  path: ???  # Must be set via command line
+  preprocess_fn_name: ???  # Must be set via command line
+  postprocess_fn_name: ???  # Must be set via command line
+
+# Sampling configuration for generative model
+sampling_config:
+  _target_: verl.workers.config.SamplingConfig
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+
+# vLLM-specific settings
+# Note: vLLM doesn't use server_config like sglang
+# Instead, it uses direct engine parameters
+dtype: bfloat16
+gpu_memory_utilization: 0.5
+enforce_eager: True
+enable_chunked_prefill: True
+enable_prefix_caching: True
+disable_log_stats: True
+skip_tokenizer_init: False
+load_format: auto
+
+# Engine-specific kwargs for vLLM
+engine_kwargs:
+  vllm:
+    # Add any vLLM-specific engine arguments here
+    # Example: attention_backend: "FLASH_ATTN"
+    null

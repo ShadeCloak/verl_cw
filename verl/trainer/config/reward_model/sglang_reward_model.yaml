@@ -1,0 +1,64 @@
+# SGLang-based generative reward model configuration
+# This extends the base reward_model.yaml for use with new RewardModelWorker
+
+# defaults specify the default config from each component
+defaults:
+  # inherit from base reward_model config
+  - reward_model
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Enable reward model
+enable: True
+
+# Reward model name (sglang for generative models)
+name: sglang
+
+# Model type: "discriminative" or "generative"
+model_type: generative
+
+# Model configuration (HFModelConfig)
+model_config:
+  _target_: verl.workers.config.HFModelConfig
+  path: ???  # Must be set via command line
+  trust_remote_code: True
+
+# Input model config (set to null if using same tokenizer as reward model)
+input_model_config: null
+
+# Sequence lengths for generative reward model
+prompt_length: 16000
+response_length: 512
+max_model_len: 32768
+
+# Parallelism settings
+tensor_model_parallel_size: 1
+
+# Batch size per GPU
+micro_batch_size_per_gpu: 32
+
+# Maximum concurrent sequences
+max_num_seqs: 64
+
+# Data processing configuration
+data_processor_config:
+  _target_: verl.workers.config.RewardModelDataProcessorConfig
+  path: ???  # Must be set via command line
+  preprocess_fn_name: ???  # Must be set via command line
+  postprocess_fn_name: ???  # Must be set via command line
+
+# Sampling configuration for generative model
+sampling_config:
+  _target_: verl.workers.config.SamplingConfig
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+
+# Server configuration for SGLang
+server_config:
+  _target_: verl.workers.config.ServerConfig
+  timeout: 600
+  max_attempts: 3
+  retry_delay: 1
+  max_connections: 1000
+  max_start_wait_time: 600
