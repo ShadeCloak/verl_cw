@@ -120,6 +120,16 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.pairwise_postprocess_fn = load_fn(dp_cfg.path, pairwise_postprocess_fn_name)
             logger.info(f"Loaded pairwise functions: {pairwise_preprocess_fn_name}, {pairwise_postprocess_fn_name}")
 
+        # Check if two_stage_grm mode is enabled
+        # Two-stage mode: P(principle|question) * P(judge|question, principle, prediction)
+        self.two_stage_grm = self.config.get("two_stage_grm", False)
+        if self.two_stage_grm:
+            # Load two-stage specific functions
+            self.construct_principles_fn = load_fn(dp_cfg.path, "construct_principles_only_input")
+            self.construct_judge_fn = load_fn(dp_cfg.path, "construct_judge_with_prefix_input")
+            self.extract_principles_fn = load_fn(dp_cfg.path, "extract_principles_from_output")
+            logger.info("Two-stage GRM mode enabled: P(principle|question) * P(judge|question, principle, prediction)")
+
 
         if self.model_type == "generative":
             assert self.preprocess_fn is not None and self.postprocess_fn is not None, (
@@ -410,6 +420,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # But dispatch/chunk may split them across workers, so we need special handling
         if self.pairwise_v1:
             token_level_scores = self._compute_pairwise_scores_with_gather(data)
+        elif self.two_stage_grm:
+            # Two-stage GRM: P(principle|question) * P(judge|question, principle, prediction)
+            token_level_scores = self._compute_two_stage_grm_scores(data)
         else:
             # Standard pointwise scoring
             rm_data = self._preprocess_reward_inputs(data)
@@ -480,6 +493,152 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             meta_info=meta_info if meta_info else {}
         )
         return output
+
+    def _compute_two_stage_grm_scores(self, data: DataProto):
+        """
+        Compute rewards using two-stage GRM:
+        P(principle|question) * P(judge|question, principle, prediction)
+        
+        Stage 1: Generate evaluation principles based on question only (shared across responses)
+        Stage 2: Evaluate each response using the shared principles as generation prefix
+        
+        Args:
+            data: DataProto containing batch of responses
+            
+        Returns:
+            token_level_scores: Tensor of shape (batch_size, response_length)
+        """
+        from collections import defaultdict
+        import numpy as np
+        
+        batch_size = data.batch.batch_size[0]
+        src_tokenizer = self.src_tokenizer
+        
+        # Get data processor config for template settings
+        dp_cfg = self.data_processor_config
+        strip_think_tag = dp_cfg.get("strip_think_tag", True)
+        template_version = dp_cfg.get("template_version", "v6")
+        
+        # ========== Step 1: Extract questions and responses, group by question ==========
+        questions = []
+        responses = []
+        question_to_indices = defaultdict(list)  # question -> list of indices
+        
+        # Store for failure case logging
+        self._original_questions = []
+        self._original_responses = []
+        
+        for i in range(batch_size):
+            data_item = data[i]
+            
+            # Get question
+            if "extra_infos" in data_item.non_tensor_batch and "question" in data_item.non_tensor_batch["extra_infos"]:
+                question = data_item.non_tensor_batch["extra_infos"]["question"]
+            else:
+                prompt_ids = data_item.batch["prompts"]
+                prompt_length = prompt_ids.shape[-1]
+                valid_prompt_length = int(data_item.batch["attention_mask"][:prompt_length].sum().item())
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+                question = src_tokenizer.decode(valid_prompt_ids.tolist(), skip_special_tokens=True)
+            
+            # Get response
+            response_ids = data_item.batch["responses"]
+            response_length = response_ids.shape[-1]
+            valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum().item())
+            valid_response_ids = response_ids[:valid_response_length]
+            response = src_tokenizer.decode(valid_response_ids.tolist(), skip_special_tokens=True)
+            
+            questions.append(question)
+            responses.append(response)
+            question_to_indices[question].append(i)
+            
+            # Store for logging
+            self._original_questions.append(question)
+            self._original_responses.append(response)
+        
+        # ========== Step 2: Generate principles for each unique question (Stage 1) ==========
+        unique_questions = list(question_to_indices.keys())
+        
+        # Construct stage 1 inputs (principles generation)
+        stage1_inputs = []
+        for q in unique_questions:
+            stage1_input = self.construct_principles_fn(
+                rollout_question=q,
+                template_version=template_version
+            )
+            stage1_inputs.append(stage1_input)
+        
+        # Call reward model for stage 1
+        logger.info(f"Two-stage GRM Stage 1: Generating principles for {len(unique_questions)} unique questions")
+        stage1_outputs = self.reward_model.compute_reward(stage1_inputs)
+        
+        # Process stage 1 outputs to extract principles
+        if stage1_outputs and isinstance(stage1_outputs[0], str):
+            stage1_texts = stage1_outputs
+        else:
+            stage1_texts = [self.tokenizer.decode(o) for o in stage1_outputs]
+        
+        question_to_principles = {}
+        for q, output_text in zip(unique_questions, stage1_texts):
+            principles = self.extract_principles_fn(output_text)
+            question_to_principles[q] = principles
+        
+        # Debug logging for stage 1
+        log_file = "/data/qingnan/verl_1214/examples/tmp/two_stage_grm_debug.log"
+        log_dir = os.path.dirname(log_file)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        try:
+            if os.path.exists(log_file):
+                with open(log_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    count = content.count('=== STAGE1 BATCH #')
+            else:
+                count = 0
+            
+            if count < 3:
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    import time
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"=== STAGE1 BATCH #{count + 1} ===\n")
+                    f.write(f"{'='*80}\n")
+                    f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Batch size: {batch_size}\n")
+                    f.write(f"Unique questions: {len(unique_questions)}\n")
+                    f.write(f"Responses per question: {[len(question_to_indices[q]) for q in unique_questions]}\n\n")
+                    
+                    for i, (q, principles) in enumerate(question_to_principles.items()):
+                        if i < 2:  # Only log first 2 questions
+                            f.write(f"--- Question {i+1} (first 500 chars) ---\n{q[:500]}\n\n")
+                            f.write(f"--- Generated Principles ---\n{principles}\n\n")
+        except Exception as e:
+            pass
+        
+        # ========== Step 3: Evaluate each response with shared principles (Stage 2) ==========
+        # Prepare stage 2 inputs in order
+        stage2_inputs = []
+        for i in range(batch_size):
+            question = questions[i]
+            response = responses[i]
+            principles = question_to_principles[question]
+            
+            stage2_input = self.construct_judge_fn(
+                rollout_question=question,
+                rollout_response=response,
+                principles_prefix=principles,
+                strip_think_tag=strip_think_tag,
+                template_version=template_version
+            )
+            stage2_inputs.append(stage2_input)
+        
+        # Call reward model for stage 2
+        logger.info(f"Two-stage GRM Stage 2: Evaluating {batch_size} responses with shared principles")
+        stage2_outputs = self.reward_model.compute_reward(stage2_inputs)
+        
+        # ========== Step 4: Process outputs to get scores ==========
+        token_level_scores = self._postprocess_reward_outputs(data, stage2_outputs)
+        
+        return token_level_scores
 
     def _compute_pairwise_scores_with_gather(self, data: DataProto):
         """

@@ -667,6 +667,224 @@ def construct_deepseek_grm_inputs_pairwise(rollout_question: str, response1: str
     return formatted_prompt
 
 
+# ============================================================================
+# Two-Stage GRM Functions (P(principle|question) * P(judge|question, principle, prediction))
+# ============================================================================
+
+# Template for first stage: generate principles based on question only
+DEEPSEEK_GRM_PRINCIPLES_ONLY_TEMPLATE = """You are a skilled expert at scoring responses. You should evaluate the given response based on judging criteria.
+
+Given the User's query, you need to:
+1. **Generate specific evaluation principles/criteria** tailored to this particular query
+2. Consider what aspects are most important for evaluating responses to this type of question
+
+Before providing principles, analyze the query carefully. Be thorough and specific.
+
+#### Conversation Context ####
+User: {question}
+
+#### Output Format Requirements ####
+You MUST output exactly in this format:
+Evaluation Principles: <List the specific evaluation principles/criteria for this query, including their relative weights>"""
+
+
+# Template for second stage: judge with principles as prefix
+DEEPSEEK_GRM_JUDGE_WITH_PRINCIPLES_TEMPLATE = """You are a skilled expert at scoring responses. You should evaluate the given response based on judging criteria.
+
+Given the User's query and the Assistant's response, you need to:
+1. **First, generate specific evaluation principles/criteria** tailored to this particular query
+2. Analyze the response based on these criteria
+3. Provide an overall comprehensive score (1-10)
+
+Before scoring, please analyze step by step. Your scoring needs to be as strict as possible.
+
+#### Conversation Context ####
+User: {question}
+
+#### Response to be Scored ####
+[The Begin of Response]
+{response}
+[The End of Response]
+
+#### Output Format Requirements ####
+You MUST output exactly in this format:
+Evaluation Principles: <List the specific evaluation principles/criteria for this query, including their relative weights>
+Analysis: <Analyze the response based on the stated principles>
+Score: \\boxed{{X}} where X is an integer from 1 to 10.
+
+IMPORTANT: The final score MUST be in the exact format \\boxed{{X}}. For example, if the score is 8, you must write: Score: \\boxed{{8}}"""
+
+
+def construct_principles_only_input(rollout_question: str, template_version: str = "v6") -> str:
+    """
+    Construct input prompt for first stage: generate principles based on question only.
+    
+    This is used in the two-stage GRM pipeline where:
+    - Stage 1: P(principle | question) - generate evaluation principles
+    - Stage 2: P(judge | question, principle, prediction) - evaluate with shared principles
+    
+    Args:
+        rollout_question: The user's question/prompt
+        template_version: Which template version to use
+        
+    Returns:
+        Formatted input string for generating principles
+    """
+    # Truncate question if too long
+    MAX_QUESTION_CHARS = 10000
+    if len(rollout_question) > MAX_QUESTION_CHARS:
+        truncation_msg = f"\n... [truncated {len(rollout_question) - MAX_QUESTION_CHARS} characters] ...\n"
+        half_len = MAX_QUESTION_CHARS // 2
+        rollout_question = rollout_question[:half_len] + truncation_msg + rollout_question[-half_len:]
+    
+    # Use principles-only template
+    prompt = DEEPSEEK_GRM_PRINCIPLES_ONLY_TEMPLATE.format(question=rollout_question)
+    
+    # Apply chat template
+    tokenizer = _get_deepseek_grm_tokenizer()
+    messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
+    return formatted_prompt
+
+
+def construct_judge_with_prefix_input(rollout_question: str, rollout_response: str, 
+                                      principles_prefix: str, strip_think_tag: bool = True,
+                                      template_version: str = "v6") -> str:
+    """
+    Construct input prompt for second stage: evaluate response with principles as prefix.
+    
+    This function creates a prompt where the previously generated principles are used
+    as the beginning of the assistant's response, and the model continues to generate
+    the analysis and score.
+    
+    Args:
+        rollout_question: The user's question/prompt
+        rollout_response: The model's generated response to evaluate
+        principles_prefix: The principles generated in stage 1 (shared across responses)
+        strip_think_tag: Whether to strip content before </think> tag
+        template_version: Which template version to use
+        
+    Returns:
+        Formatted input string with principles prefix for scoring
+    """
+    # Truncate if response is too long
+    MAX_RESPONSE_CHARS = 30000
+    if len(rollout_response) > MAX_RESPONSE_CHARS:
+        truncation_msg = f"\n... [truncated {len(rollout_response) - MAX_RESPONSE_CHARS} characters] ...\n"
+        half_len = MAX_RESPONSE_CHARS // 2
+        rollout_response = rollout_response[:half_len] + truncation_msg + rollout_response[-half_len:]
+    
+    # Truncate question if too long
+    MAX_QUESTION_CHARS = 10000
+    if len(rollout_question) > MAX_QUESTION_CHARS:
+        truncation_msg = f"\n... [truncated {len(rollout_question) - MAX_QUESTION_CHARS} characters] ...\n"
+        half_len = MAX_QUESTION_CHARS // 2
+        rollout_question = rollout_question[:half_len] + truncation_msg + rollout_question[-half_len:]
+    
+    # Strip </think> tag if requested
+    if strip_think_tag and '</think>' in rollout_response:
+        rollout_response = rollout_response.split('</think>')[-1].strip()
+    
+    # Use judge template with response
+    prompt = DEEPSEEK_GRM_JUDGE_WITH_PRINCIPLES_TEMPLATE.format(
+        question=rollout_question,
+        response=rollout_response
+    )
+    
+    # Apply chat template with principles as assistant prefix
+    tokenizer = _get_deepseek_grm_tokenizer()
+    
+    # The principles_prefix becomes the start of the assistant's response
+    # The model will continue from here to generate Analysis and Score
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": principles_prefix}
+    ]
+    
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True  # This will add the continuation marker
+    )
+    
+    # Debug logging
+    log_file = "/data/qingnan/verl_1214/examples/tmp/two_stage_grm_debug.log"
+    log_dir = os.path.dirname(log_file)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    try:
+        if os.path.exists(log_file):
+            with open(log_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                count = content.count('=== STAGE2 INPUT #')
+        else:
+            count = 0
+        
+        if count < 5:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*80}\n")
+                f.write(f"=== STAGE2 INPUT #{count + 1} ===\n")
+                f.write(f"{'='*80}\n")
+                f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Question Length: {len(rollout_question)}\n")
+                f.write(f"Response Length: {len(rollout_response)}\n")
+                f.write(f"Principles Prefix Length: {len(principles_prefix)}\n\n")
+                f.write(f"--- Principles Prefix ---\n{principles_prefix}\n\n")
+                f.write(f"--- Formatted Prompt ---\n{formatted_prompt}\n\n")
+    except Exception as e:
+        pass
+    
+    return formatted_prompt
+
+
+def extract_principles_from_output(output: str) -> str:
+    """
+    Extract the principles section from the first stage GRM output.
+    
+    The output format is expected to be:
+    Evaluation Principles: <principles content>
+    
+    We want to extract everything after "Evaluation Principles:" to use as prefix.
+    
+    Args:
+        output: The generated output from stage 1
+        
+    Returns:
+        The principles text to use as prefix for stage 2
+    """
+    # Try to find "Evaluation Principles:" and extract everything after it
+    patterns = [
+        r'Evaluation Principles:\s*',
+        r'Evaluation Principles：\s*',  # Chinese colon
+        r'评估原则:\s*',
+        r'评估原则：\s*',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            # Return from the start of "Evaluation Principles:" to the end
+            # This includes the header so stage 2 continues naturally
+            principles = output[match.start():]
+            
+            # Optionally truncate if there's an "Analysis:" section already started
+            # (which shouldn't happen in stage 1, but just in case)
+            analysis_match = re.search(r'\n\s*Analysis:', principles)
+            if analysis_match:
+                principles = principles[:analysis_match.start()]
+            
+            return principles.strip()
+    
+    # If no pattern found, return the whole output as prefix
+    # This handles edge cases where the model might format differently
+    return output.strip()
+
+
 def convert_deepseek_grm_pairwise_output_to_comparison(output: str) -> int:
     """
     Convert DeepSeek-GRM pairwise comparison output to a binary result.
