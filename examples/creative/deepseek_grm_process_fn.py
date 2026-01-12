@@ -672,47 +672,77 @@ def construct_deepseek_grm_inputs_pairwise(rollout_question: str, response1: str
 # ============================================================================
 
 # Template for first stage: generate principles based on question only
-DEEPSEEK_GRM_PRINCIPLES_ONLY_TEMPLATE = """You are a skilled expert at scoring responses. You should evaluate the given response based on judging criteria.
+# Aligned with generate_sft_from_results.py PRINCIPLE_GENERATION_TEMPLATE
+DEEPSEEK_GRM_PRINCIPLES_ONLY_TEMPLATE = r"""You are an expert at designing evaluation criteria. Given a user's query, your task is to generate specific evaluation principles/criteria that would be used to score any response to this query.
 
-Given the User's query, you need to:
-1. **Generate specific evaluation principles/criteria** tailored to this particular query
-2. Consider what aspects are most important for evaluating responses to this type of question
+You should consider:
+1. What aspects are most important for this specific type of query?
+2. What would make a response excellent vs. poor for this query?
+3. How should different criteria be weighted based on the query's nature?
 
-Before providing principles, analyze the query carefully. Be thorough and specific.
+Your evaluation criteria MUST begin with **Factual Accuracy** and **Instruction Compliance & Consistency**, and these two should account for more than 30% of the total weight. Add **Safety** if the query involves potentially harmful content.
 
-#### Conversation Context ####
-User: {question}
+#### User Query ####
+{question}
 
 #### Output Format Requirements ####
 You MUST output exactly in this format:
-Evaluation Principles: <List the specific evaluation principles/criteria for this query, including their relative weights>"""
+
+Evaluation Principles:
+1. [Criterion 1 Name] (Weight: X%): <Brief description of what this criterion evaluates and why it's important for this query>
+2. [Criterion 2 Name] (Weight: X%): <Brief description of what this criterion evaluates and why it's important for this query>
+3. [Criterion 3 Name] (Weight: X%): <Brief description of what this criterion evaluates and why it's important for this query>
+4. [Criterion 4 Name] (Weight: X%): <Brief description of what this criterion evaluates and why it's important for this query>
+5. [Criterion 5 Name] (Weight: X%): <Brief description of what this criterion evaluates and why it's important for this query>
+
+Note: The weights must sum to 100%. You may have 5-7 criteria depending on the query's complexity."""
 
 
 # Template for second stage: judge with principles as prefix
-DEEPSEEK_GRM_JUDGE_WITH_PRINCIPLES_TEMPLATE = """You are a skilled expert at scoring responses. You should evaluate the given response based on judging criteria.
+# Aligned with generate_sft_from_results.py SCORE_WITH_PRINCIPLE_TEMPLATE
+DEEPSEEK_GRM_JUDGE_WITH_PRINCIPLES_TEMPLATE = r"""You are a skilled expert at scoring responses. Based on the given evaluation principles, analyze the response and provide a comprehensive score.
 
-Given the User's query and the Assistant's response, you need to:
-1. **First, generate specific evaluation principles/criteria** tailored to this particular query
-2. Analyze the response based on these criteria
-3. Provide an overall comprehensive score (1-10)
+Scoring Guidelines:
+- The score is a number with one decimal place between 1.0 and 10.0
+- Score 9.0-10.0: Exceptional response that fully meets all criteria with outstanding quality
+- Score 7.0-9.0: Good response that meets most criteria with minor areas for improvement
+- Score 5.0-7.0: Adequate response that meets basic requirements but has noticeable weaknesses
+- Score 3.0-5.0: Below average response with significant issues or missing key elements
+- Score below 3.0: Poor response that fails to meet most criteria or contains major errors 
 
-Before scoring, please analyze step by step. Your scoring needs to be as strict as possible.
-
-#### Conversation Context ####
-User: {question}
+#### User Query ####
+{question}
 
 #### Response to be Scored ####
 [The Begin of Response]
 {response}
 [The End of Response]
 
-#### Output Format Requirements ####
-You MUST output exactly in this format:
-Evaluation Principles: <List the specific evaluation principles/criteria for this query, including their relative weights>
-Analysis: <Analyze the response based on the stated principles>
-Score: \\boxed{{X}} where X is an integer from 1 to 10.
+#### Evaluation Principles (Pre-defined) ####
+{principle}
 
-IMPORTANT: The final score MUST be in the exact format \\boxed{{X}}. For example, if the score is 8, you must write: Score: \\boxed{{8}}"""
+#### Output Format Requirements ####
+Based on the above evaluation principles, you MUST output exactly in this format:
+
+Analysis:
+- **[Criterion 1 Name]**: <Detailed analysis of performance on this criterion, explaining strengths and weaknesses>. Score: X.X/10.0
+- **[Criterion 2 Name]**: <Detailed analysis of performance on this criterion, explaining strengths and weaknesses>. Score: X.X/10.0
+- **[Criterion 3 Name]**: <Detailed analysis of performance on this criterion, explaining strengths and weaknesses>. Score: X.X/10.0
+- **[Criterion 4 Name]**: <Detailed analysis of performance on this criterion, explaining strengths and weaknesses>. Score: X.X/10.0
+- **[Criterion 5 Name]**: <Detailed analysis of performance on this criterion, explaining strengths and weaknesses>. Score: X.X/10.0
+
+Conclusion: <A comprehensive summary of your analysis, highlighting main strengths and weaknesses>
+
+Final Score (Weighted Average): <Show the calculation: weight1×score1 + weight2×score2 + ... = final_score>
+
+Score: \boxed{{X.X}}
+
+CRITICAL REQUIREMENTS:
+1. In "Analysis", provide detailed analysis for each criterion from the given principles
+2. Each criterion MUST be scored out of 10.0 (format: "Score: X.X/10.0")
+3. The final score MUST be the weighted average of all criterion scores based on the given weights
+4. Show your weighted average calculation explicitly before the boxed score
+6. The final boxed score must have one decimal place"""
 
 
 def construct_principles_only_input(rollout_question: str, template_version: str = "v6") -> str:
@@ -790,26 +820,24 @@ def construct_judge_with_prefix_input(rollout_question: str, rollout_response: s
     if strip_think_tag and '</think>' in rollout_response:
         rollout_response = rollout_response.split('</think>')[-1].strip()
     
-    # Use judge template with response
+    # Use judge template with response and principles
+    # The principles_prefix is now directly embedded in the prompt template
     prompt = DEEPSEEK_GRM_JUDGE_WITH_PRINCIPLES_TEMPLATE.format(
         question=rollout_question,
-        response=rollout_response
+        response=rollout_response,
+        principle=principles_prefix
     )
     
-    # Apply chat template with principles as assistant prefix
+    # Apply chat template
     tokenizer = _get_deepseek_grm_tokenizer()
     
-    # The principles_prefix becomes the start of the assistant's response
-    # The model will continue from here to generate Analysis and Score
-    messages = [
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": principles_prefix}
-    ]
+    # The prompt now contains the principles, so no need to use assistant prefix mode
+    messages = [{"role": "user", "content": prompt}]
     
     formatted_prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True  # This will add the continuation marker
+        add_generation_prompt=True
     )
     
     # Debug logging
