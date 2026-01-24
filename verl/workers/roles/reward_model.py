@@ -243,11 +243,20 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             else:
                 assert self.preprocess_fn is not None, "generative reward model must have preprocess_fn"
 
-                input_str = self.preprocess_fn(
-                    rollout_question=rollout_question,
-                    rollout_response=rollout_response,
-                    ground_truth=ground_truth,
-                )
+                # Get principals from data if available (for Single-Stage GRM)
+                principals = data_item.non_tensor_batch.get("principals", None)
+
+                # Build kwargs for preprocess_fn
+                preprocess_kwargs = {
+                    "rollout_question": rollout_question,
+                    "rollout_response": rollout_response,
+                    "ground_truth": ground_truth,
+                }
+                # Add principals if available (for Single-Stage GRM with pre-generated principles)
+                if principals is not None:
+                    preprocess_kwargs["principals"] = principals
+
+                input_str = self.preprocess_fn(**preprocess_kwargs)
 
                 # For DeepSeek-GRM: the preprocess_fn already constructs the complete prompt
                 # IMPORTANT: For vLLM compatibility with DeepSeek-GRM, we need to pass string prompts
