@@ -404,6 +404,70 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 self._invalid_mask = None
             # ========== End of invalid handling logic ==========
 
+            # ========== PENALTY FOR SELF-EVALUATION (Reward Hacking Prevention) ==========
+            # Check if original responses contain self-grading patterns and penalize them
+            # This is a CODE-LEVEL enforcement (not relying on reward model to follow instructions)
+            SELF_EVAL_PATTERNS = [
+                # Chinese patterns
+                "特点总结：", "评分（满分10分）：", "综合评分：", "总评：", "总分：",
+                "评分：", "得分：", "打分：", "分数：",
+                # English patterns
+                "Score (on 10-point scale):", "Tone & Style Summary:", "Overall Rating:",
+                "Overall Score:", "Final Score:", "Total Score:",
+                # Score patterns like "9.8/10", "9.9/10" etc at the end of response
+                "/10 —", "/10—", "/10（", "/10 (",
+            ]
+            SCORE_PATTERN_REGEX = r'\b[89]\.\d/10\b|\b10/10\b|\b9\.[5-9]/10\b'
+
+            PENALTY_SCORE = 3.0  # Assign low score for self-evaluation responses
+
+            if hasattr(self, '_original_responses') and self._original_responses:
+                import re
+                num_penalized = 0
+                for idx, response in enumerate(self._original_responses):
+                    if idx >= len(scores):
+                        break
+
+                    # Check last 2000 characters of response for self-evaluation patterns
+                    response_tail = response[-2000:] if len(response) > 2000 else response
+
+                    is_self_eval = False
+                    matched_pattern = None
+
+                    # Check string patterns
+                    for pattern in SELF_EVAL_PATTERNS:
+                        if pattern in response_tail:
+                            is_self_eval = True
+                            matched_pattern = pattern
+                            break
+
+                    # Check regex pattern for scores like "9.8/10"
+                    if not is_self_eval:
+                        if re.search(SCORE_PATTERN_REGEX, response_tail):
+                            is_self_eval = True
+                            matched_pattern = "score_pattern_regex"
+
+                    # Apply penalty
+                    if is_self_eval:
+                        original_score = scores[idx]
+                        scores[idx] = PENALTY_SCORE
+                        num_penalized += 1
+
+                        # Log first few penalized cases
+                        if num_penalized <= 3:
+                            logger.warning(
+                                f"[SELF-EVAL PENALTY] Sample {idx}: "
+                                f"Detected pattern '{matched_pattern}', "
+                                f"score {original_score:.1f} -> {PENALTY_SCORE:.1f}"
+                            )
+
+                if num_penalized > 0:
+                    logger.warning(
+                        f"[SELF-EVAL PENALTY] Penalized {num_penalized}/{len(scores)} responses "
+                        f"for containing self-evaluation patterns (score -> {PENALTY_SCORE})"
+                    )
+            # ========== End of self-evaluation penalty logic ==========
+
             scores = torch.tensor(scores)
 
         token_level_scores = self._expand_to_token_level(data, scores)
